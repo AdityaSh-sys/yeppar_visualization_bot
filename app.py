@@ -23,7 +23,6 @@ def read_uploaded_file(uploaded_file):
             st.error("Unsupported file type. Please upload CSV or Excel.")
             return None
 
-        # Try to parse date-like columns
         for col in df.columns:
             if any(kw in col.lower() for kw in ["date", "time", "year"]):
                 try:
@@ -35,18 +34,17 @@ def read_uploaded_file(uploaded_file):
         st.error(f"Error reading file: {e}")
         return None
 
-def ask_generative_model(instruction, columns, preview, viz_type=None):
-    viz_clause = ""
+def ask_generative_model(instruction, columns, preview_summary, preview_sample, viz_type=None):
+    viz_clause = "Only generate a chart if explicitly asked. Otherwise, answer in text or tables."
     if viz_type and viz_type.lower() != "let assistant pick":
         viz_clause = f"Always use a {viz_type.lower()} chart if visualization is required."
-    else:
-        viz_clause = "Only generate a chart if explicitly asked. Otherwise, answer in text or tables."
 
     prompt = f"""
 You are a helpful data assistant. The user may ask questions about their uploaded data in plain language.
 You have a pandas DataFrame named df with columns: {columns}
+Summary: {preview_summary}
 Preview:
-{preview}
+{preview_sample}
 
 User: {instruction}
 Chart type preference: {viz_type}
@@ -173,9 +171,10 @@ if st.session_state.data_df is not None:
             st.session_state.chat_history.append({"role": "user", "content": user_query})
             df = st.session_state.data_df
             columns = ', '.join(df.columns)
-            preview = df.head(5).to_string(index=False)
+            preview_summary = f"Rows: {df.shape[0]}, Columns: {df.shape[1]}"
+            preview_sample = df.sample(min(50, len(df))).to_string(index=False)
             with st.spinner("Assistant is thinking..."):
-                response = ask_generative_model(user_query, columns, preview, viz_type)
+                response = ask_generative_model(user_query, columns, preview_summary, preview_sample, viz_type)
 
             kind, output = extract_code_and_kind(response)
             if kind == "code":
