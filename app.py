@@ -1,26 +1,27 @@
+import os
+import io
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import io
+from dotenv import load_dotenv
 import google.generativeai as genai
 
-# ======= GEMINI API KEY =======
-GEMINI_API_KEY = ''  # Replace with your real Gemini API Key!
-# ==============================
-
+# ========== Load API key from .env ==========
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
+# ========== Helper Functions ==========
 def read_uploaded_file(uploaded_file):
     try:
         if uploaded_file.name.endswith(('xlsx', 'xls')):
-            df = pd.read_excel(uploaded_file)
+            return pd.read_excel(uploaded_file)
         elif uploaded_file.name.endswith('csv'):
-            df = pd.read_csv(uploaded_file)
+            return pd.read_csv(uploaded_file)
         else:
-            st.error("Unsupported file type. Please upload a CSV or Excel file.")
+            st.error("Unsupported file type. Please upload CSV or Excel.")
             return None
-        return df
     except Exception as e:
         st.error(f"Error reading file: {e}")
         return None
@@ -32,17 +33,17 @@ def ask_gemini(instruction, columns, preview, viz_type=None):
         viz_clause = "If a visual is better than a text answer, pick the best chart shape yourself."
 
     prompt = f"""
-You are a helpful data assistant. The user is not technical and may type very simple or vague questions about their data, with or without selecting a chart-type preference. 
+You are a helpful data assistant. The user is not technical and may type very simple or vague questions about their data.
 You have a pandas DataFrame named df with columns: {columns}
 Preview:
 {preview}
 
 User: {instruction}
 Chart type: {viz_type}
-
 {viz_clause}
-- If you answer with a visualization, OUTPUT ONLY valid, executable Python plotting code (using matplotlib or seaborn, plt and sns are already imported). Output code inside a markdown code block. Do NOT add any explanation, comments, or extra plain text.
-- If you answer with a summary or text, OUTPUT ONLY a one-sentence plain answer. Never return code and text in the same response.
+
+- If answering with visualization, OUTPUT ONLY valid Python code using matplotlib/seaborn inside ```python code blocks```.
+- If answering with summary, return ONLY a one-line plain text.
 """
 
     model = genai.GenerativeModel('gemini-1.5-flash')
@@ -53,22 +54,17 @@ Chart type: {viz_type}
         return f"GEN_AI_ERROR: {e}"
 
 def extract_code_and_kind(gemini_response):
-    # Try to detect code block (prefers python code block, but also plain code block)
     if gemini_response.lstrip().startswith("```"):
         code_block = gemini_response.split("```")[1]
-        # Remove 'python' if present
         if code_block.lstrip().startswith("python"):
             code_block = code_block[len("python"):].lstrip("\n")
         return "code", code_block.strip()
-    # Check for plt.show() in plain responses (sometimes Gemini omits code block)
     if "plt.show()" in gemini_response:
         return "code", gemini_response
     return "text", gemini_response.strip()
 
 def try_execute_code(code, df):
     buf = io.BytesIO()
-    import matplotlib.pyplot as plt
-    import seaborn as sns
     plt.close("all")
     locs = {'df': df, 'plt': plt, 'sns': sns}
     try:
@@ -81,52 +77,90 @@ def try_execute_code(code, df):
     except Exception as e:
         return None, str(e)
 
-# Streamlit UI
-st.set_page_config(page_title="Chat Data Explorer", page_icon="📊", layout="centered")
-st.title("📊 Chat with Your Data")
+# ========== Streamlit UI ==========
+st.set_page_config(page_title="Chat Data Explorer", page_icon="📊", layout="wide")
 
+# -- Sidebar Setup --
+st.sidebar.header("📂 Upload your data")
+uploaded_file = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
+if st.sidebar.button("Clear Session", use_container_width=True):
+    st.session_state.clear()
+    st.experimental_rerun()
+
+# -- Session State --
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 if 'data_df' not in st.session_state:
     st.session_state.data_df = None
 
-uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xls", "xlsx"])
+# -- Load & Preview File --
 if uploaded_file:
     df = read_uploaded_file(uploaded_file)
     if df is not None:
         st.session_state.data_df = df
-        st.success(f"File loaded: {uploaded_file.name}")
-        st.dataframe(df.head())
-        st.write(f"**Rows:** {df.shape[0]} | **Columns:** {df.shape[1]}")
+        st.sidebar.success(f"📄 {uploaded_file.name}")
+        st.sidebar.caption(f"{round(uploaded_file.size/1024, 1)} KB")
+        st.sidebar.markdown("**Preview:**")
+        st.sidebar.dataframe(df.head(), use_container_width=True, height=200)
+        st.sidebar.info(f"**Rows:** {df.shape[0]}  \n**Cols:** {df.shape[1]}")
 else:
-    st.info("Upload a file to start.")
+    st.sidebar.info("Upload a file to start.")
 
+# -- Main Title --
+st.markdown(
+    """
+    <h1 style='display:flex; align-items:center; gap:12px;'>📊 Data Chatbot</h1>
+    <p>Interact with your data using natural language.<br>
+    <span style='color:gray;font-size:14px;'>Ask questions or request charts in plain English.</span></p>
+    """,
+    unsafe_allow_html=True
+)
+
+# -- Main Chat Logic --
 if st.session_state.data_df is not None:
     st.divider()
-    st.subheader("Ask about your data (and optionally pick a chart style)")
+    st.subheader("Chat about your data:")
+    chat_area = st.container()
+    icons = {
+        "user": "🧑‍💻",
+        "bot": "🤖",
+        "plot": "🖼️",
+        "code-debug": "🛠️"
+    }
     for msg in st.session_state.chat_history:
-        if msg['role'] == "user":
-            st.markdown(f"🧑‍💻 **You:** {msg['content']}")
-        elif msg['role'] == "bot":
-            if msg["type"] == "text":
-                st.markdown(f"😊 **Bot:** {msg['content']}")
-            elif msg["type"] == "plot":
-                st.markdown(f"😊 **Bot:** Here’s what I found!")
-                st.image(msg["img"], use_column_width=True)
-            elif msg["type"] == "code-debug":
-                with st.expander("Debug: See the exact code from Gemini"):
-                    st.code(msg["code"], language="python")
+        if msg["role"] == "user":
+            with chat_area:
+                st.markdown(
+                    f"<div style='background-color:#f8f9fa; padding:10px 15px; border-radius:10px;'>"
+                    f"<b>{icons['user']} You:</b> {msg['content']}</div>", unsafe_allow_html=True)
+        elif msg["role"] == "bot":
+            if msg.get("type") == "text":
+                with chat_area:
+                    st.markdown(
+                        f"<div style='background-color:#fffbe7; padding:10px 15px; border-radius:10px;'>"
+                        f"<b>{icons['bot']} Bot:</b> {msg['content']}</div>", unsafe_allow_html=True)
+            elif msg.get("type") == "plot":
+                with chat_area:
+                    st.markdown(
+                        f"<div style='background-color:#eafbf7; padding:10px 15px; border-radius:10px;'>"
+                        f"<b>{icons['plot']} Chart:</b></div>", unsafe_allow_html=True)
+                    st.image(msg["img"], use_column_width=True)
+            elif msg.get("type") == "code-debug":
+                with chat_area:
+                    with st.expander("🔧 Code generated by Gemini"):
+                        st.code(msg["code"], language="python")
 
-    viz_options = [
-        "Let Gemini pick", "Bar", "Line", "Pie", "Scatter"
-    ]
+    st.divider()
+
+    # -- Chat Input Form --
+    viz_options = ["Let Gemini pick", "Bar", "Line", "Pie", "Scatter"]
     with st.form("chat_form", clear_on_submit=True):
-        col1, col2 = st.columns([5, 2])
+        col1, col2 = st.columns([6, 2])
         with col1:
-            user_query = st.text_input("Type your question (e.g. 'compare the regions', or just 'show changes')")
+            user_query = st.text_input("Ask a question or describe a chart...", placeholder="e.g. Trend of revenue by year")
         with col2:
-            viz_type = st.selectbox("Chart type (optional)", viz_options)
-        submitted = st.form_submit_button("Send")
+            viz_type = st.selectbox("Chart Style", viz_options)
+        submitted = st.form_submit_button("Send", use_container_width=True)
 
         if submitted and user_query:
             st.session_state.chat_history.append({"role": "user", "content": user_query})
@@ -137,27 +171,23 @@ if st.session_state.data_df is not None:
                 gemini_response = ask_gemini(user_query, columns, preview, viz_type)
             kind, out = extract_code_and_kind(gemini_response)
             if kind == "code":
-                # Always show Gemini code for debugging under an expander
                 st.session_state.chat_history.append({"role": "bot", "type": "code-debug", "code": out})
                 fig_data, err = try_execute_code(out, df)
                 if fig_data:
                     st.session_state.chat_history.append({"role": "bot", "type": "plot", "img": fig_data})
                 else:
-                    st.session_state.chat_history.append(
-                        {"role": "bot", "type": "text",
-                         "content": f"Sorry, I couldn't make the chart: {err}"}
-                    )
-            elif kind == "text":
+                    st.session_state.chat_history.append({
+                        "role": "bot", "type": "text",
+                        "content": f"Sorry, chart code failed: {err}"
+                    })
+            else:
                 st.session_state.chat_history.append({"role": "bot", "type": "text", "content": out})
             st.rerun()
 
-st.markdown("""
----
-**Example questions:**  
-- "Show how sales changed"  
-- "Compare the regions"  
-- "Who sold the most?"  
-- (Choose "Bar", "Line", "Pie" or "Scatter" if you want a style!)
-
-_You can upload `.csv`, `.xlsx`, or `.xls` files._
-""")
+else:
+    st.markdown(
+        "<div style='margin-top:40px; color:gray; text-align:center;'>"
+        "⬅️ Start by uploading a table in the sidebar.<br>"
+        "Sample questions: <br> <i>Show profits by year, Compare two items, Trend of sales over time</i></div>",
+        unsafe_allow_html=True
+    )
