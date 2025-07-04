@@ -160,8 +160,24 @@ if st.session_state.data_df is not None:
                         f"<div style='background-color:#eafbf7; padding:10px 15px; border-radius:10px;'>"
                         f"<b>{icons['plot']} Chart:</b></div>", unsafe_allow_html=True)
                     st.image(msg["img"], use_column_width=True)
+
                     if "summary" in msg:
-                        st.markdown(f"<div style='font-size:14px; color:gray; margin-top:6px;'>{msg['summary']}</div>", unsafe_allow_html=True)
+                        st.markdown(
+                            f"""
+                            <div style='
+                                background-color: #f2f2f2;
+                                padding: 12px 16px;
+                                margin-top: 10px;
+                                border-left: 4px solid #4CAF50;
+                                border-radius: 6px;
+                                font-size: 15px;
+                                color: #333;
+                            '>
+                            <b>📌 Summary:</b><br>{msg['summary']}
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
 
     st.divider()
 
