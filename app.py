@@ -26,18 +26,24 @@ def read_uploaded_file(uploaded_file):
         st.error(f"Error reading file: {e}")
         return None
 
-def ask_model(instruction, columns, preview):
+def ask_model(instruction, columns, preview, viz_type=None):
+    if viz_type and viz_type.lower() != "let assistant pick":
+        viz_clause = f"Always use a {viz_type.lower()} chart if a chart is requested."
+    else:
+        viz_clause = "If a visual is required, pick the best chart shape yourself."
+
     prompt = f"""
-You are a helpful data assistant. The user may ask questions about a dataset without specifying a chart. 
+You are a helpful data assistant. The user may ask questions about a dataset, request charts, summaries, or table slices.
 You have a pandas DataFrame named df with columns: {columns}
 Preview:
 {preview}
 
 User: {instruction}
+{viz_clause}
 
 - If the user asks for a chart or visualization, OUTPUT ONLY valid Python code using matplotlib/seaborn inside ```python code blocks```.
 - If the user asks to see a specific part of the data (like a table or filter), return ONLY a pandas DataFrame expression that selects the desired rows/columns, inside a python code block.
-- Otherwise, respond with a one-line summary, insight, or statistic from the data.
+- Otherwise, respond with a one-line summary or insight.
 - Do not output both text and code together.
 """
 
@@ -78,16 +84,21 @@ def try_execute_code(code, df):
     plt.close("all")
     locs = {'df': df, 'plt': plt, 'sns': sns, 'pd': pd}
     try:
-        exec(code, {}, locs)
-        if 'plt' in code or 'sns' in code:
+        if 'plt.' in code or 'sns.' in code:
+            exec(code, {}, locs)
             fig = plt.gcf()
             fig.savefig(buf, format="png", bbox_inches='tight')
             buf.seek(0)
             plt.close(fig)
             return 'plot', buf, None
-        elif 'df' in code:
-            result_df = eval(code.strip().split("=")[-1], {}, locs)
-            return 'table', result_df, None
+        elif code.strip().startswith("df"):
+            result_df = eval(code.strip(), {}, locs)
+            if isinstance(result_df, (pd.DataFrame, pd.Series)):
+                return 'table', result_df, None
+            else:
+                return 'text', str(result_df), None
+        else:
+            return None, None, "Invalid or unrecognized code block."
     except Exception as e:
         return None, None, str(e)
 
@@ -183,13 +194,18 @@ if st.session_state.data_df is not None:
                     st.markdown(
                         f"<div style='background-color:#eef2ff; padding:10px 15px; border-radius:10px;'>"
                         f"<b>{icons['table']} Table:</b></div>", unsafe_allow_html=True)
-                    st.dataframe(msg["df"], use_container_width=True)
+                    st.dataframe(msg["df"], use_column_width=True)
 
     st.divider()
 
-    # -- Chat Input Form --
+    # -- Chat Input Form with Chart Type Dropdown --
+    viz_options = ["Let Assistant Pick", "Bar", "Line", "Pie", "Scatter"]
     with st.form("chat_form", clear_on_submit=True):
-        user_query = st.text_input("Ask a question, request a chart or table...", placeholder="e.g. Show top 5 rows where sales > 1000")
+        col1, col2 = st.columns([6, 2])
+        with col1:
+            user_query = st.text_input("Ask a question, request a chart or table...", placeholder="e.g. Show top 5 rows where sales > 1000")
+        with col2:
+            viz_type = st.selectbox("Chart Style (optional)", viz_options)
         submitted = st.form_submit_button("Send", use_container_width=True)
 
         if submitted and user_query:
@@ -198,7 +214,7 @@ if st.session_state.data_df is not None:
             columns = ', '.join(df.columns)
             preview = df.head(5).to_string(index=False)
             with st.spinner("Thinking..."):
-                model_response = ask_model(user_query, columns, preview)
+                model_response = ask_model(user_query, columns, preview, viz_type)
             kind, out = extract_code_and_kind(model_response)
             if kind == "code":
                 output_type, result, err = try_execute_code(out, df)
@@ -215,6 +231,11 @@ if st.session_state.data_df is not None:
                         "role": "bot",
                         "type": "table",
                         "df": result
+                    })
+                elif output_type == 'text':
+                    st.session_state.chat_history.append({
+                        "role": "bot", "type": "text",
+                        "content": result
                     })
                 else:
                     st.session_state.chat_history.append({
