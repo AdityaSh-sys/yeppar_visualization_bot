@@ -26,24 +26,19 @@ def read_uploaded_file(uploaded_file):
         st.error(f"Error reading file: {e}")
         return None
 
-def ask_model(instruction, columns, preview, viz_type=None):
-    if viz_type and viz_type.lower() != "let model pick":
-        viz_clause = f"Always use a {viz_type.lower()} chart if a chart is needed."
-    else:
-        viz_clause = "Pick the best chart type automatically if visualization is suitable."
-
+def ask_model(instruction, columns, preview):
     prompt = f"""
-You are a helpful data assistant. The user may type simple or vague questions about their data.
+You are a helpful data assistant. The user may ask questions about a dataset without specifying a chart. 
 You have a pandas DataFrame named df with columns: {columns}
 Preview:
 {preview}
 
 User: {instruction}
-Chart type: {viz_type}
-{viz_clause}
 
-- If answering with visualization, OUTPUT ONLY valid Python code using matplotlib/seaborn inside ```python code blocks```.
-- If answering with summary, return ONLY a one-line plain text.
+- If the user asks for a chart or visualization, OUTPUT ONLY valid Python code using matplotlib/seaborn inside ```python code blocks```.
+- If the user asks to see a specific part of the data (like a table or filter), return ONLY a pandas DataFrame expression that selects the desired rows/columns, inside a python code block.
+- Otherwise, respond with a one-line summary, insight, or statistic from the data.
+- Do not output both text and code together.
 """
 
     model = genai.GenerativeModel('gemini-1.5-flash')
@@ -74,23 +69,27 @@ def extract_code_and_kind(response):
         if code_block.lstrip().startswith("python"):
             code_block = code_block[len("python"):].lstrip("\n")
         return "code", code_block.strip()
-    if "plt.show()" in response:
+    if "plt.show()" in response or "pd." in response or "df[" in response:
         return "code", response
     return "text", response.strip()
 
 def try_execute_code(code, df):
     buf = io.BytesIO()
     plt.close("all")
-    locs = {'df': df, 'plt': plt, 'sns': sns}
+    locs = {'df': df, 'plt': plt, 'sns': sns, 'pd': pd}
     try:
         exec(code, {}, locs)
-        fig = plt.gcf()
-        fig.savefig(buf, format="png", bbox_inches='tight')
-        buf.seek(0)
-        plt.close(fig)
-        return buf, None
+        if 'plt' in code or 'sns' in code:
+            fig = plt.gcf()
+            fig.savefig(buf, format="png", bbox_inches='tight')
+            buf.seek(0)
+            plt.close(fig)
+            return 'plot', buf, None
+        elif 'df' in code:
+            result_df = eval(code.strip().split("=")[-1], {}, locs)
+            return 'table', result_df, None
     except Exception as e:
-        return None, str(e)
+        return None, None, str(e)
 
 # ========== Streamlit UI ==========
 st.set_page_config(page_title="Chat Data Explorer", page_icon="📊", layout="wide")
@@ -126,7 +125,7 @@ st.markdown(
     """
     <h1 style='display:flex; align-items:center; gap:12px;'>📊 Data Chatbot</h1>
     <p>Interact with your data using natural language.<br>
-    <span style='color:gray;font-size:14px;'>Ask questions or request charts in plain English.</span></p>
+    <span style='color:gray;font-size:14px;'>Ask questions, request charts or tables in plain English.</span></p>
     """,
     unsafe_allow_html=True
 )
@@ -139,7 +138,8 @@ if st.session_state.data_df is not None:
     icons = {
         "user": "🧑‍💻",
         "bot": "🤖",
-        "plot": "🖼️"
+        "plot": "🖼️",
+        "table": "📋"
     }
 
     for msg in st.session_state.chat_history:
@@ -178,17 +178,18 @@ if st.session_state.data_df is not None:
                             """,
                             unsafe_allow_html=True
                         )
+            elif msg.get("type") == "table":
+                with chat_area:
+                    st.markdown(
+                        f"<div style='background-color:#eef2ff; padding:10px 15px; border-radius:10px;'>"
+                        f"<b>{icons['table']} Table:</b></div>", unsafe_allow_html=True)
+                    st.dataframe(msg["df"], use_container_width=True)
 
     st.divider()
 
     # -- Chat Input Form --
-    viz_options = ["Let model pick", "Bar", "Line", "Pie", "Scatter"]
     with st.form("chat_form", clear_on_submit=True):
-        col1, col2 = st.columns([6, 2])
-        with col1:
-            user_query = st.text_input("Ask a question or describe a chart...", placeholder="e.g. Trend of revenue by year")
-        with col2:
-            viz_type = st.selectbox("Preferred Chart", viz_options)
+        user_query = st.text_input("Ask a question, request a chart or table...", placeholder="e.g. Show top 5 rows where sales > 1000")
         submitted = st.form_submit_button("Send", use_container_width=True)
 
         if submitted and user_query:
@@ -197,22 +198,28 @@ if st.session_state.data_df is not None:
             columns = ', '.join(df.columns)
             preview = df.head(5).to_string(index=False)
             with st.spinner("Thinking..."):
-                model_response = ask_model(user_query, columns, preview, viz_type)
+                model_response = ask_model(user_query, columns, preview)
             kind, out = extract_code_and_kind(model_response)
             if kind == "code":
-                fig_data, err = try_execute_code(out, df)
-                if fig_data:
+                output_type, result, err = try_execute_code(out, df)
+                if output_type == 'plot':
                     summary = generate_chart_summary(out)
                     st.session_state.chat_history.append({
                         "role": "bot",
                         "type": "plot",
-                        "img": fig_data,
+                        "img": result,
                         "summary": summary
+                    })
+                elif output_type == 'table':
+                    st.session_state.chat_history.append({
+                        "role": "bot",
+                        "type": "table",
+                        "df": result
                     })
                 else:
                     st.session_state.chat_history.append({
                         "role": "bot", "type": "text",
-                        "content": f"Sorry, chart code failed: {err}"
+                        "content": f"Sorry, code failed: {err}"
                     })
             else:
                 st.session_state.chat_history.append({"role": "bot", "type": "text", "content": out})
