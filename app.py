@@ -150,7 +150,7 @@ if st.session_state.data_df is not None:
                 chat_area.markdown(
                     f"<div style='background-color:#eafbf7; padding:10px 15px; border-radius:10px;'>"
                     f"<b>{icons['plot']} Chart:</b></div>", unsafe_allow_html=True)
-                chat_area.image(msg["img"], use_column_width=True)
+                chat_area.image(msg["img"], use_container_width=True)
                 if msg.get("summary"):
                     chat_area.markdown(
                         f"<div style='color:gray; font-size:14px; padding-top:5px;'>💡 {msg['summary']}</div>",
