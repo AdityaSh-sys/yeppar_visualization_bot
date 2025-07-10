@@ -7,12 +7,13 @@ import seaborn as sns
 from dotenv import load_dotenv
 import google.generativeai as genai
 
-# ========== Load API key from .env ==========
+# ========== Load API key ==========
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
 # ========== Helper Functions ==========
+
 def read_uploaded_file(uploaded_file):
     try:
         if uploaded_file.name.endswith(('xlsx', 'xls')):
@@ -22,39 +23,44 @@ def read_uploaded_file(uploaded_file):
         else:
             st.error("Unsupported file type. Please upload CSV or Excel.")
             return None
-
+        # Attempt to parse date-like columns
         for col in df.columns:
             if any(kw in col.lower() for kw in ["date", "time", "year"]):
                 try:
-                    df[col] = pd.to_datetime(df[col])
-                except:
-                    pass
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                except Exception as e:
+                    st.warning(f"Could not convert column '{col}' to datetime: {e}")
         return df
     except Exception as e:
         st.error(f"Error reading file: {e}")
         return None
 
 def ask_generative_model(instruction, columns, preview_summary, preview_sample, viz_type=None):
-    viz_clause = "Only generate a chart if explicitly asked. Otherwise, answer in text or tables."
+    viz_clause = "Only generate code, tables, or charts in triple backticks if the user specifically asks for data analysis or visualization. Otherwise, answer briefly in plain English."
     if viz_type and viz_type.lower() != "let assistant pick":
-        viz_clause = f"Always use a {viz_type.lower()} chart if visualization is required."
+        viz_clause = f"If a chart is requested, prefer a {viz_type.lower()} chart."
 
     prompt = f"""
-You are a helpful data assistant. The user may ask questions about their uploaded data in plain language.
-You have a pandas DataFrame named df with columns: {columns}
-Summary: {preview_summary}
-Preview:
-{preview_sample}
+You are a helpful data assistant.
+You have a Pandas DataFrame named `df` with columns: {columns}
 
-User: {instruction}
-Chart type preference: {viz_type}
+Instructions:
+
+- If the user query is about data content (showing rows, a certain row, columns, values, statistics, counts, totals, minimum, maximum, average, filtering by column/date), DO NOT answer in English; instead, always reply with the exact Python code that gets the value or DataFrame, assigning the result to a variable named `result`, inside triple backticks (```python ... ```).
+- For calculation queries ("total", "count", "sum", "average"), always output as a one-row DataFrame/Table.
+- For chart/drawing requests, output code for the plot, assign any table result to `result`, and include plt.show().
+- For vague/description queries ("what is this data", "describe the data", "summary"), use a short conversational answer in English.
+- NEVER reply with "I don't have access to the data" or "Please provide the DataFrame"—the DataFrame is available as `df`.
+- If the query is "last row", reply with code for `result = df.tail(1)` (not with an explanation).
+- Only respond with either a code block or a text block; never mix explanations and code.
+- Never use placeholders; always use the real values from the data when possible.
+
+Data Summary: {preview_summary}
+Sample Data (first 10 rows): {preview_sample}
+User Query: "{instruction}"
+Chart preference: {viz_type}
 {viz_clause}
-
-- If asked for a chart, respond with valid Python code inside triple backticks (```python ... ```).
-- If asked for a table, reply with the pandas code that returns the table (e.g. df[...] or df.query(...))
-- If asked a simple question, respond with a short 1-line text.
 """
-
     model = genai.GenerativeModel('gemini-1.5-flash')
     try:
         response = model.generate_content(prompt)
@@ -68,7 +74,7 @@ def extract_code_and_kind(response):
         if code_block.lstrip().startswith("python"):
             code_block = code_block[len("python"):].lstrip("\n")
         return "code", code_block.strip()
-    elif "plt.show()" in response or "df[" in response or "df." in response:
+    elif "plt.show()" in response or "df[" in response or "df." in response or "result" in response:
         return "code", response
     return "text", response.strip()
 
@@ -78,19 +84,30 @@ def try_execute_code(code, df):
     locs = {'df': df.copy(), 'plt': plt, 'sns': sns, 'pd': pd}
     try:
         exec(code, {}, locs)
+        plot, table = None, None
         if "plt.show()" in code:
             fig = plt.gcf()
             fig.savefig(buf, format="png", bbox_inches='tight')
             buf.seek(0)
-            plt.close(fig)
-            return "plot", buf, None
-        elif isinstance(locs.get("df"), pd.DataFrame):
-            return "table", locs["df"], None
+            plot = buf
+        result = locs.get("result")
+        if isinstance(result, (pd.DataFrame, pd.Series)):
+            table = result if isinstance(result, pd.DataFrame) else result.to_frame()
+        # If a series with unnamed index, better to put to_frame().T for single values (e.g., count)
+        if isinstance(table, pd.DataFrame) and table.shape == (1, 1) and table.columns[0] == 0:
+            table.columns = ["Value"]
+        if plot and table is not None:
+            return "both", {"plot": plot, "table": table}, None
+        elif plot:
+            return "plot", plot, None
+        elif table is not None:
+            return "table", table, None
         return None, None, "No output generated"
     except Exception as e:
         return None, None, str(e)
 
 # ========== Streamlit UI ==========
+
 st.set_page_config(page_title="📊 Data Chatbot", page_icon="📊", layout="wide")
 
 st.sidebar.header("📂 Upload your data")
@@ -117,10 +134,9 @@ else:
     st.sidebar.info("Upload a file to begin.")
 
 st.markdown(
-    """
-    <h1 style='display:flex; align-items:center; gap:12px;'>📊 Data Chatbot</h1>
-    <p>Ask anything about your data. Get insights, charts, or tables with natural language.</p>
-    """,
+    "<h1 style='display:flex; align-items:center; gap:12px;'>📊 Data Chatbot</h1>"
+    "<p>Ask anything about your data. Get insights, charts, or tables with natural language.<br/>"
+    "<i>For best results, be specific, like: 'Show total revenue by region as bar chart', or just ask 'What does this data describe?'</i></p>",
     unsafe_allow_html=True
 )
 
@@ -134,7 +150,8 @@ if st.session_state.data_df is not None:
         "plot": "📈",
         "table": "📋"
     }
-    for msg in st.session_state.chat_history:
+    # Show chat including download/export for tables/plots
+    for i, msg in enumerate(st.session_state.chat_history):
         if msg["role"] == "user":
             chat_area.markdown(
                 f"<div style='background-color:#f8f9fa; padding:10px 15px; border-radius:10px;'>"
@@ -143,19 +160,63 @@ if st.session_state.data_df is not None:
             if msg["type"] == "text":
                 chat_area.markdown(
                     f"<div style='background-color:#fffbe7; padding:10px 15px; border-radius:10px;'>"
-                    f"<b>{icons['bot']} Assistant:</b> {msg['content']}</div>", unsafe_allow_html=True)
+                    f"{icons['bot']} Assistant: {msg['content']}</div>", unsafe_allow_html=True)
             elif msg["type"] == "plot":
-                chat_area.markdown(
-                    f"<div style='background-color:#eafbf7; padding:10px 15px; border-radius:10px;'>"
-                    f"<b>{icons['plot']} Chart:</b></div>", unsafe_allow_html=True)
+                chat_area.markdown(f"{icons['plot']} Chart Output:")
                 chat_area.image(msg["img"], use_container_width=True)
-                if msg.get("summary"):
-                    chat_area.markdown(
-                        f"<div style='color:gray; font-size:14px; padding-top:5px;'>💡 {msg['summary']}</div>",
-                        unsafe_allow_html=True)
+                chat_area.download_button(
+                    label="🖼️ Download Chart as PNG",
+                    data=msg["img"].getvalue(),
+                    file_name=f"chart_{i}.png",
+                    mime="image/png",
+                    use_container_width=True
+                )
             elif msg["type"] == "table":
-                chat_area.markdown(f"<b>{icons['table']} Table Output:</b>")
+                chat_area.markdown(f"{icons['bot']} Assistant: Here is the data you asked for:")
                 chat_area.dataframe(msg["table"], use_container_width=True)
+                csv = msg["table"].to_csv(index=False).encode('utf-8')
+                chat_area.download_button(
+                    label="⬇️ Export Table as CSV",
+                    data=csv,
+                    file_name=f"exported_table_{i}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            elif msg["type"] == "both":
+                chat_area.markdown(f"{icons['plot']} Chart Output:")
+                chat_area.image(msg["plot"], use_container_width=True)
+                chat_area.download_button(
+                    label="🖼️ Download Chart as PNG",
+                    data=msg["plot"].getvalue(),
+                    file_name=f"chart_{i}.png",
+                    mime="image/png",
+                    use_container_width=True
+                )
+                chat_area.markdown(f"{icons['bot']} Assistant: Here is the data you asked for:")
+                chat_area.dataframe(msg["table"], use_container_width=True)
+                csv = msg["table"].to_csv(index=False).encode('utf-8')
+                chat_area.download_button(
+                    label="⬇️ Export Table as CSV",
+                    data=csv,
+                    file_name=f"exported_table_{i}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+    # Export full chat history
+    if st.session_state.chat_history:
+        chat_log = "\n\n".join([
+            f"User: {msg['content']}" if msg["role"] == "user" else
+            f"Assistant: {msg['content']}" if msg["type"] == "text" else
+            f"Assistant: [Chart/Table Output]"
+            for msg in st.session_state.chat_history
+        ])
+        st.download_button(
+            label="📝 Export Chat History as TXT",
+            data=chat_log.encode("utf-8"),
+            file_name="chat_history.txt",
+            mime="text/plain",
+            use_container_width=True
+        )
 
     st.divider()
     viz_options = ["Let Assistant pick", "Bar", "Line", "Pie", "Scatter"]
@@ -172,7 +233,7 @@ if st.session_state.data_df is not None:
             df = st.session_state.data_df
             columns = ', '.join(df.columns)
             preview_summary = f"Rows: {df.shape[0]}, Columns: {df.shape[1]}"
-            preview_sample = df.sample(min(50, len(df))).to_string(index=False)
+            preview_sample = df.head(10).to_string(index=False)  # head for speed
             with st.spinner("Assistant is thinking..."):
                 response = ask_generative_model(user_query, columns, preview_summary, preview_sample, viz_type)
 
@@ -181,20 +242,24 @@ if st.session_state.data_df is not None:
                 result_type, result_data, err = try_execute_code(output, df)
                 if result_type == "plot":
                     st.session_state.chat_history.append({
-                        "role": "bot", "type": "plot", "img": result_data,
-                        "summary": f"Here's a visualization based on your query: '{user_query}'."
+                        "role": "bot", "type": "plot", "img": result_data
                     })
                 elif result_type == "table":
                     st.session_state.chat_history.append({
                         "role": "bot", "type": "table", "table": result_data
                     })
+                elif result_type == "both":
+                    st.session_state.chat_history.append({
+                        "role": "bot", "type": "both", "plot": result_data["plot"], "table": result_data["table"]
+                    })
                 else:
                     st.session_state.chat_history.append({
-                        "role": "bot", "type": "text",
-                        "content": f"Sorry, code failed: {err}"})
+                        "role": "bot", "type": "text", "content": f"Sorry, code failed: {err}"
+                    })
             else:
                 st.session_state.chat_history.append({
-                    "role": "bot", "type": "text", "content": output})
+                    "role": "bot", "type": "text", "content": output
+                })
             st.rerun()
 else:
     st.markdown(
